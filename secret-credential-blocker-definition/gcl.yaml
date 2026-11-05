@@ -10,7 +10,7 @@ metadata:
       they leak to an upstream service, model, tool or agent.
     category: Security
     metadata/interfaceScope: api
-    metadata/capabilities/assetTypes: rest,http,mcp,a2a,a2av1
+    metadata/capabilities/assetTypes: rest,http,mcp,a2a,a2a_v1
 spec:
   extends:
     - name: extension-definition
