@@ -14,7 +14,7 @@ pub const POLICY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/wasm32
 pub const COMMON_CONFIG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/config");
 
 // Policy implementation reference name (`target/policy-ref-name.txt` after `make build`).
-pub const POLICY_NAME: &str = "secret-credential-blocker-flex-v1-0";
+pub const POLICY_NAME: &str = "secret-credential-blocker-flex-v1-1";
 
 // Fixtures are assembled at runtime so repository secret scanners do not flag this file.
 pub fn token() -> String {

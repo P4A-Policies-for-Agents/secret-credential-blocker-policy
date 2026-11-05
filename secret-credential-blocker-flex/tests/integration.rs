@@ -197,3 +197,75 @@ async fn sse_buffer_redact() -> anyhow::Result<()> {
     assert!(s.contains("[REDACTED:github_token]") && !s.contains(&token()), "{s}");
     Ok(())
 }
+
+// ── LLM traffic (the format header stands in for the LLM proxy's first policy) ──
+
+#[pdk_test]
+async fn llm_openai_block() -> anyhow::Result<()> {
+    let (_c, url, mock) = setup_test(json!({})).await?;
+    let upstream = mock
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST);
+            then.status(200).body("{}");
+        })
+        .await;
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": format!("key {}", aws_id())}]});
+    let r = post(&format!("{url}/v1/chat/completions"), body, &[("x-llm-input-format", "openai")]).await?;
+    assert_eq!(r.status(), 400);
+    let b: Value = r.json().await?;
+    assert_eq!(b["error"]["code"], "secret_detected");
+    upstream.assert_hits_async(0).await;
+    Ok(())
+}
+
+#[pdk_test]
+async fn llm_anthropic_redact() -> anyhow::Result<()> {
+    let (_c, url, mock) = setup_test(json!({"action": "redact"})).await?;
+    let upstream = mock
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).json_body(json!({
+                "model": "c", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "use [REDACTED:github_token]"}]
+            }));
+            then.status(200).body("{}");
+        })
+        .await;
+    let body = json!({"model": "c", "max_tokens": 8, "messages": [{"role": "user", "content": format!("use {}", token())}]});
+    let r = post(&format!("{url}/v1/messages"), body, &[("x-llm-input-format", "anthropic")]).await?;
+    assert_eq!(r.status(), 200);
+    upstream.assert_async().await;
+    Ok(())
+}
+
+#[pdk_test]
+async fn llm_gemini_block() -> anyhow::Result<()> {
+    let (_c, url, _mock) = setup_test(json!({})).await?;
+    let body = json!({"contents": [{"role": "user", "parts": [{"text": token()}]}]});
+    let r = post(&format!("{url}/v1beta/models/g:generateContent"), body, &[("x-input-format", "gemini")]).await?;
+    assert_eq!(r.status(), 400);
+    let b: Value = r.json().await?;
+    assert_eq!(b["error"]["status"], "INVALID_ARGUMENT");
+    Ok(())
+}
+
+#[pdk_test]
+async fn llm_openai_stream_split_secret_terminates() -> anyhow::Result<()> {
+    let (_c, url, mock) = setup_test(json!({"responseScanning": {"enabled": true}})).await?;
+    let text = format!("here: {} end", token());
+    let mut sse = String::new();
+    for piece in text.as_bytes().chunks(6) {
+        let d = json!({"id": "c", "choices": [{"index": 0, "delta": {"content": String::from_utf8_lossy(piece)}}]});
+        sse.push_str(&format!("data: {d}\n\n"));
+    }
+    sse.push_str("data: [DONE]\n\n");
+    mock.mock_async(|when, then| {
+        when.method(httpmock::Method::POST);
+        then.status(200).header("content-type", "text/event-stream").body(sse);
+    })
+    .await;
+    let body = json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let s = post(&format!("{url}/v1/chat/completions"), body, &[("x-llm-input-format", "openai")]).await?.text().await?;
+    assert!(s.contains("secret_detected_in_response") && !s.contains("[DONE]"), "{s}");
+    Ok(())
+}
+

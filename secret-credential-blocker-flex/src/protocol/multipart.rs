@@ -204,7 +204,7 @@ mod tests {
     fn run(body: &[u8], redact: bool, skip: &[&str]) -> Result<MultipartScan> {
         let s = Scanner::new(&[], &[], None, Allowlist::default(), "").unwrap();
         let skip = SkipSet::parse(&skip.iter().map(|s| format!("multipart:{s}")).collect::<Vec<_>>()).unwrap();
-        let w = Walker { scanner: &s, skip: &skip, decode_base64: false, max_decoded_bytes: 0, redact };
+        let w = Walker { scanner: &s, skip: &skip, decode_base64: false, max_decoded_bytes: 0, redact, llm_media: false };
         scan(body, "XyZ", &w)
     }
 

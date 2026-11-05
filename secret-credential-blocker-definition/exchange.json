@@ -2,7 +2,7 @@
   "main": "gcl.yaml",
   "groupId": "00000000-0000-0000-0000-000000000000",
   "assetId": "secret-credential-blocker",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "Secret & Credential Leakage Blocker",
   "description": "Detects and blocks, redacts or reports secrets and credentials in REST, MCP and A2A (v0.3 and v1.0) traffic."
 }

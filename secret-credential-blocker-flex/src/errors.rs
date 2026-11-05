@@ -6,6 +6,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::protocol::llm::Dialect;
 use crate::protocol::Protocol;
 use crate::walk::Hit;
 
@@ -159,8 +160,51 @@ pub fn build(
             let v = json!({"error": {"code": status, "status": grpc, "message": msg, "details": [detail.error_info(code)]}});
             (status, "application/json", v)
         }
+        Protocol::Llm(d) => {
+            let status = match (dir, reason) {
+                (Direction::Request, Reason::Secret) => 400,
+                (Direction::Request, Reason::Unscannable) => 413,
+                (Direction::Response, _) => 500,
+            };
+            (status, "application/json", llm_error(d, status, code, &format!("{msg}{}", detail.summary()), detail))
+        }
     };
     Reply { status, content_type: ct, body: serde_json::to_vec(&body).unwrap_or_default() }
+}
+
+/// The provider-native error object, so vendor SDKs raise a regular
+/// (non-retryable for 4xx) API error.
+fn llm_error(d: Dialect, status: u32, code: &str, message: &str, detail: &Detail) -> Value {
+    let kind = if status < 500 { "invalid_request_error" } else { "api_error" };
+    match d {
+        Dialect::OpenAi => json!({"error": {
+            "message": message,
+            "type": if status < 500 { "invalid_request_error" } else { "server_error" },
+            "code": code.to_ascii_lowercase(),
+            "param": null,
+        }}),
+        Dialect::Anthropic => json!({"type": "error", "error": {"type": kind, "message": message}}),
+        Dialect::Gemini => {
+            let grpc = if status < 500 { "INVALID_ARGUMENT" } else { "INTERNAL" };
+            json!({"error": {"code": status, "status": grpc, "message": message, "details": [detail.error_info(code)]}})
+        }
+    }
+}
+
+/// The SSE event that ends a blocked LLM stream: `(event name, data)`.
+pub fn llm_stream_event(d: Dialect, op: Option<&str>, reason: Reason, detail: &Detail) -> (Option<&'static str>, String) {
+    let code = reason_code(reason, Direction::Response);
+    let message = format!("{}{}", message(reason, Direction::Response), detail.summary());
+    let (event, v) = match d {
+        Dialect::OpenAi if op == Some("responses") => (
+            Some("error"),
+            json!({"type": "error", "code": code.to_ascii_lowercase(), "message": message, "param": null}),
+        ),
+        Dialect::OpenAi => (None, llm_error(d, 500, code, &message, detail)),
+        Dialect::Anthropic => (Some("error"), llm_error(d, 500, code, &message, detail)),
+        Dialect::Gemini => (None, llm_error(d, 500, code, &message, detail)),
+    };
+    (event, serde_json::to_string(&v).unwrap_or_default())
 }
 
 fn rpc_code(dir: Direction, reason: Reason) -> i64 {
@@ -199,10 +243,27 @@ mod tests {
     fn all(dir: Direction, reason: Reason, show: bool) -> Vec<Reply> {
         let h = hits();
         let d = Detail { hits: &h, show, domain: "p4a.ai" };
-        [Protocol::Rest, Protocol::JsonRpc, Protocol::Mcp, Protocol::A2aLegacy, Protocol::A2aV1JsonRpc, Protocol::A2aV1Http]
-            .into_iter()
-            .flat_map(|p| [build(p, Some("tools/call"), Some(&json!(1)), dir, reason, &d), build(p, None, None, dir, reason, &d)])
-            .collect()
+        let mut out: Vec<Reply> = [
+            Protocol::Rest,
+            Protocol::JsonRpc,
+            Protocol::Mcp,
+            Protocol::A2aLegacy,
+            Protocol::A2aV1JsonRpc,
+            Protocol::A2aV1Http,
+            Protocol::Llm(Dialect::OpenAi),
+            Protocol::Llm(Dialect::Anthropic),
+            Protocol::Llm(Dialect::Gemini),
+        ]
+        .into_iter()
+        .flat_map(|p| [build(p, Some("tools/call"), Some(&json!(1)), dir, reason, &d), build(p, None, None, dir, reason, &d)])
+        .collect();
+        for dialect in [Dialect::OpenAi, Dialect::Anthropic, Dialect::Gemini] {
+            for op in [Some("responses"), None] {
+                let (_, data) = llm_stream_event(dialect, op, reason, &d);
+                out.push(Reply { status: 0, content_type: "text/event-stream", body: data.into_bytes() });
+            }
+        }
+        out
     }
 
     #[test]
@@ -264,6 +325,33 @@ mod tests {
         let b = body(&r);
         assert_eq!(b["error"]["status"], "INVALID_ARGUMENT");
         assert_eq!(b["error"]["details"][0]["reason"], "SECRET_DETECTED");
+    }
+
+    #[test]
+    fn llm_shapes() {
+        let h = hits();
+        let d = Detail { hits: &h, show: true, domain: "p4a.ai" };
+        let r = build(Protocol::Llm(Dialect::OpenAi), None, None, Direction::Request, Reason::Secret, &d);
+        assert_eq!((r.status, r.content_type), (400, "application/json"));
+        let b = body(&r);
+        assert_eq!(b["error"]["type"], "invalid_request_error");
+        assert_eq!(b["error"]["code"], "secret_detected");
+        assert!(b["error"]["message"].as_str().unwrap().contains("github_token"));
+        let b = body(&build(Protocol::Llm(Dialect::Anthropic), None, None, Direction::Request, Reason::Unscannable, &d));
+        assert_eq!((b["type"].clone(), b["error"]["type"].clone()), (json!("error"), json!("invalid_request_error")));
+        let r = build(Protocol::Llm(Dialect::Gemini), None, None, Direction::Response, Reason::Secret, &d);
+        let b = body(&r);
+        assert_eq!((b["error"]["code"].clone(), b["error"]["status"].clone()), (json!(500), json!("INTERNAL")));
+        assert_eq!(b["error"]["details"][0]["reason"], "SECRET_DETECTED_IN_RESPONSE");
+        let (ev, data) = llm_stream_event(Dialect::Anthropic, None, Reason::Secret, &d);
+        assert_eq!(ev, Some("error"));
+        assert_eq!(serde_json::from_str::<Value>(&data).unwrap()["error"]["type"], "api_error");
+        let (ev, data) = llm_stream_event(Dialect::OpenAi, Some("responses"), Reason::Secret, &d);
+        assert_eq!(ev, Some("error"));
+        assert_eq!(serde_json::from_str::<Value>(&data).unwrap()["type"], "error");
+        let (ev, data) = llm_stream_event(Dialect::OpenAi, Some("chat.completions"), Reason::Secret, &d);
+        assert_eq!(ev, None);
+        assert_eq!(serde_json::from_str::<Value>(&data).unwrap()["error"]["type"], "server_error");
     }
 
     #[test]

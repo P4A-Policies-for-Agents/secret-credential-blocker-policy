@@ -27,6 +27,11 @@ pub struct EntropyConfig {
     pub threshold: Option<f64>,
 }
 #[derive(Deserialize, Clone, Debug)]
+pub struct LlmConfig {
+    #[serde(alias = "scanScope")]
+    pub scan_scope: Option<String>,
+}
+#[derive(Deserialize, Clone, Debug)]
 pub struct ResponseScanningConfig {
     #[serde(alias = "action")]
     pub action: Option<String>,
@@ -68,6 +73,8 @@ pub struct Config {
     pub error_domain: Option<String>,
     #[serde(alias = "fingerprintSalt")]
     pub fingerprint_salt: Option<String>,
+    #[serde(alias = "llm")]
+    pub llm: Option<LlmConfig>,
     #[serde(alias = "maxBodyBytes")]
     pub max_body_bytes: Option<i64>,
     #[serde(alias = "oversizeBehavior")]

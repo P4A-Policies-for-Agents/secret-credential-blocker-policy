@@ -4,7 +4,8 @@ This spec covers PDK 1.10.0 and has been tested on Flex Gateway 1.12.1 (minimum 
 
 ## 1. Scope
 
-One policy that detects secrets and credentials in REST, MCP and A2A traffic and
+One policy that detects secrets and credentials in REST, MCP, A2A and LLM (OpenAI,
+Anthropic, Gemini) traffic and
 **blocks**, **redacts** or **monitors** them. It covers the request leg always and
 the response leg optionally. It is stateless: it makes no outbound calls and stores nothing.
 
@@ -42,6 +43,7 @@ gRPC (`application/grpc*`) is never scanned.
 
 | Signal | Protocol |
 |---|---|
+| `x-llm-input-format` or `x-input-format` header = `openai` / `anthropic` / `gemini` (case-insensitive) | LLM, in that format |
 | `A2A-Version: 1.0` header or `?A2A-Version=1.0` (key case-insensitive) + HTTP+JSON route | A2A v1 HTTP+JSON |
 | HTTP+JSON route whose last segment has `:` (e.g. `/acme/message:send`) | A2A v1 HTTP+JSON |
 | JSON-RPC 2.0 body with an A2A v1 method (`SendMessage`, `GetTask`, …) | A2A v1 JSON-RPC |
@@ -58,6 +60,20 @@ scanned as a whole document.
 When `protocol` is forced, auto-detection is skipped. `rest` treats everything as REST.
 `mcp` and `a2a` use the matching vocabulary and error shapes.
 
+**LLM traffic.** A gateway policy has no runtime field that names the asset type it is
+applied to. The signal used instead is the request-format header that the LLM proxy's
+first policy sets on every request. With `protocol: auto`, that header is the only way
+a request is treated as LLM traffic, so the same body on a REST API stays REST. With
+`protocol: llm`, every request is LLM traffic. The header still names the format; when
+it is absent, the format comes from the request:
+
+- a `:generateContent` / `:streamGenerateContent` path, or a `contents` member → Gemini;
+- a `/messages` path, or `messages` plus `system`, `anthropic_version` or `stop_sequences` → Anthropic;
+- `messages`, `input` or `prompt` → OpenAI (Chat Completions, Responses, Completions);
+- otherwise the body is scanned whole, with LLM error shapes.
+
+A body whose shape does not match any format is scanned as a whole document.
+
 ## 4. What is scanned
 
 | Protocol / operation | Scan roots |
@@ -73,6 +89,9 @@ When `protocol` is forced, auto-detection is skipped. `rest` treats everything a
 | REST `text/*`, XML, unparseable JSON | whole body as text, location `body` |
 | `multipart/form-data`, `multipart/mixed` | see below (`scan.multipart`) |
 | Other content types (images, octet-stream, …) | not scanned |
+| LLM OpenAI | `$.messages[*]` (content, text parts, `tool_calls[*].function.arguments`), `$.input`, `$.instructions`, `$.prompt` |
+| LLM Anthropic | `$.messages[*]` (text, `tool_use.input`, `tool_result.content`), `$.system` |
+| LLM Gemini | `$.contents[*]` (`text`, `functionCall.args`, `functionResponse.response`), `$.systemInstruction` |
 
 Within JSON, every string value is scanned, and so is every member name/value pair
 (the key-name check, §5). Finding locations are JSON paths like
@@ -86,6 +105,25 @@ Within JSON, every string value is scanned, and so is every member name/value pa
 - If the result is UTF-8 text, it is scanned. The location gets a `(base64)` suffix, e.g. `$.params.message.parts[1].file.bytes(base64)`.
 - On redact, the text is re-encoded.
 - Binary content is skipped.
+
+**LLM requests.**
+
+- Model, sampling parameters and tool *definitions* (`tools`, `functions`) are not scanned.
+- Tool-call arguments are JSON-encoded strings and are scanned as text, so a
+  `"password": "..."` inside them is still found by `generic_secret_assignment`.
+- Media (`data:…;base64,` URIs, Anthropic `source.data`, Gemini `inlineData.data`,
+  OpenAI `input_audio.data` / `file_data`) is decoded under `scan.decodeBase64Parts`
+  (up to `scan.maxDecodedBytes`). Text documents are scanned and re-encoded on redact;
+  images, audio and other binary data are skipped, never scanned as base64 text.
+- `llm.scanScope: latestTurn` scans only the items after the last model turn
+  (`role: assistant` / `model`, or an OpenAI Responses `function_call`) and the
+  instructions only on a first turn (no model turn yet). Clients resend the whole
+  conversation on every call, so with `all` an earlier secret is reported again on each
+  call (and, under `redact`, redacted again: the client keeps its own unredacted copy).
+  **Earlier turns are forwarded unscanned with `latestTurn`**, so a secret left in the
+  history (for example after a blocked call the client did not drop) reaches the model
+  on the next call. Use `latestTurn` for `monitor` rollouts; keep `all` with `block` and
+  `redact`.
 
 **Multipart.**
 
@@ -162,9 +200,14 @@ input; `-32603` for response blocks; `-32600` for unscannable requests. The A2A
 | A2A v0.3 | `200`, `-32602`, `data` is a string `"SECRET_DETECTED (github_token at $.params…)"` | `-32603`, string data |
 | A2A v1 JSON-RPC | `200`, `-32602`, `data: [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", reason, domain, metadata {detectors, paths}}]` | `-32603`, `SECRET_DETECTED_IN_RESPONSE` |
 | A2A v1 HTTP+JSON | `400 {error {code: 400, status: INVALID_ARGUMENT, message, details: [ErrorInfo]}}` | body → `{error {code: 500, status: INTERNAL, …}}` |
+| LLM OpenAI | `400 {error {message, type: invalid_request_error, code: secret_detected, param: null}}` | body → same with `type: server_error`, `code: secret_detected_in_response` |
+| LLM Anthropic | `400 {type: error, error {type: invalid_request_error, message}}` | body → same with `api_error` |
+| LLM Gemini | `400 {error {code: 400, status: INVALID_ARGUMENT, message, details: [ErrorInfo]}}` | body → `{error {code: 500, status: INTERNAL, …}}` |
 | Unscannable + `failClosed` | `413` problem (`payload-unscannable`) / `-32600 PAYLOAD_UNSCANNABLE` / v1 `413 INVALID_ARGUMENT` | body → same error |
 
-JSON-RPC errors echo the request `id`. In a response block the `id` comes from the
+LLM errors put the detectors and locations in `message` (unless `errorDetail: false`),
+so the vendor SDKs show them in their regular API error. A `400` is not retried by the
+SDKs. JSON-RPC errors echo the request `id`. In a response block the `id` comes from the
 upstream payload when present. `ErrorInfo.metadata` values are always strings, as
 `google.rpc.ErrorInfo` requires. `errorDomain` defaults to `p4a.ai`.
 
@@ -191,6 +234,23 @@ upstream payload when present. `ErrorInfo.metadata` values are always strings, a
 | `monitor` | Read-only: findings are logged and the stream is untouched |
 
 When `responseScanning.action` resolves to `monitor`, SSE is handled as `monitor`.
+
+**LLM streams.** A model streams its output a few characters per event, so a secret is
+usually split across many events. For LLM traffic the completion deltas (OpenAI
+`choices[*].delta.content` and `tool_calls[*].function.arguments`, Responses
+`*.delta`, Anthropic `delta.text` / `partial_json`, Gemini `candidates[*].content.parts[*].text`)
+are concatenated into one running text and scanned as a whole (the last 8–16 KiB are
+kept). Location: `completion`. Events that carry no delta are scanned as JSON.
+
+- `block` and `redact` both end the stream at the event that completes the secret,
+  with a provider-native error event: OpenAI Chat `data: {"error": {…}}`, OpenAI
+  Responses `event: error` + `{type: error, code, message}`, Anthropic `event: error` +
+  `{type: error, error {type: api_error, message}}`, Gemini `data: {"error": {…}}`.
+  Redact cannot take back the earlier part of the secret that was already sent, so it
+  acts as block on LLM streams.
+- `monitor` only reports.
+- Non-streamed LLM responses are scanned as a whole document; redact rewrites only the
+  affected strings.
 In `stream` mode, an unterminated event at end of stream is dropped. SSE clients
 discard such events anyway.
 
@@ -199,7 +259,7 @@ discard such events anyway.
 Each finding produces one `warn` line:
 
 ```
-[secret-blocker] <request|response> <rest|mcp|jsonrpc|a2a-0.3|a2a-1.0-jsonrpc|a2a-1.0-http> op=<method|-> action=<block|redact|monitor> detector=<kind> location=<path> fingerprint=sha256:<12 hex>
+[secret-blocker] <request|response> <rest|mcp|jsonrpc|a2a-0.3|a2a-1.0-jsonrpc|a2a-1.0-http|llm-openai|llm-anthropic|llm-gemini> op=<method|-> action=<block|redact|monitor> detector=<kind> location=<path> fingerprint=sha256:<12 hex>
 ```
 
 An unscannable payload logs `[secret-blocker] request not scanned: <why>; passed unscanned (failOpen)`
@@ -211,14 +271,15 @@ never logged, because it may contain allowlisted values and the salt.
 | Property | Type / default | Validation |
 |---|---|---|
 | `action` | `block` \| `redact` \| `monitor` = `block` | |
-| `protocol` | `auto` \| `rest` \| `mcp` \| `a2a` = `auto` | |
+| `protocol` | `auto` \| `rest` \| `mcp` \| `a2a` \| `llm` = `auto` | |
+| `llm` | `{scanScope: all}` | `all` \| `latestTurn` |
 | `disabledDetectors[]` | built-in names = `[]` | |
 | `customPatterns[]` | `{name, regex}` = `[]` | valid Rust regex; `name` letters/digits/`_`/`-` |
 | `entropy` | `{enabled: false, threshold: 4.5, minLength: 24}` | `minLength` 8…1024 |
 | `allowlist` | `{values, fingerprints, patterns, skipPaths}` | fingerprints `sha256:<12 hex>`; valid regexes and paths |
 | `scan` | `{headers: [], queryParams: true, restBody: true, multipart: true, decodeBase64Parts: true, maxDecodedBytes: 262144}` | `maxDecodedBytes` 0…4194304 |
 | `responseScanning` | `{enabled: false, action: inherit, sseMode: stream}` | |
-| `maxBodyBytes` | `1048576` | 1024…16777216; keep it below the gateway buffer |
+| `maxBodyBytes` | `1048576` | 1024…16777216; keep it below the gateway buffer. LLM conversations with long histories or images usually need 4–8 MiB |
 | `oversizeBehavior` | `failOpen` \| `failClosed` = `failOpen` | |
 | `errorDetail` | `true` | |
 | `errorDomain` | `p4a.ai` | |
@@ -246,7 +307,12 @@ tune the configuration:
 - Redacting can leave a body that exceeds the buffer. In that case the request is
   blocked (fail closed).
 - A secret split across two JSON string values, or across two SSE events, isn't seen
-  as one value.
+  as one value. Exception: LLM completion deltas (§7).
+- On LLM streams, the part of a secret sent before the event that completes it has
+  already reached the client (§7).
+- On LLM proxies, the policy must run after the proxy's first policy, which sets the
+  format header. It does so automatically on LLM proxy instances; on other API types
+  use `protocol: llm`.
 
 ## 12. Tests
 
@@ -254,5 +320,6 @@ tune the configuration:
   unit tests, plus in-process pdk-unit tests covering both legs. No Docker needed.
 - `make test`: everything above, plus Flex 1.12.1 integration tests
   (`tests/integration.rs`) for REST, query rewrite, multipart, MCP, A2A v0.3/v1/HTTP+JSON,
-  MCP response `isError`, and SSE stream redact/terminate. Needs Docker and
+  MCP response `isError`, SSE stream redact/terminate, LLM OpenAI/Gemini block,
+  Anthropic redact and an OpenAI stream with a secret split across deltas. Needs Docker and
   `tests/config/registration.yaml`.

@@ -47,6 +47,8 @@ pub struct Settings {
     pub fail_closed: bool,
     pub error_detail: bool,
     pub error_domain: String,
+    /// `llm.scanScope: latestTurn`.
+    pub llm_latest_turn: bool,
 }
 
 pub struct ResponseSettings {
@@ -79,7 +81,13 @@ impl Settings {
             "rest" => Mode::Rest,
             "mcp" => Mode::Mcp,
             "a2a" => Mode::A2a,
-            other => bail!("protocol must be auto, rest, mcp or a2a (got '{other}')"),
+            "llm" => Mode::Llm,
+            other => bail!("protocol must be auto, rest, mcp, a2a or llm (got '{other}')"),
+        };
+        let llm_latest_turn = match c.llm.as_ref().and_then(|l| l.scan_scope.as_deref()).unwrap_or("all") {
+            "all" => false,
+            "latestTurn" => true,
+            other => bail!("llm.scanScope must be all or latestTurn (got '{other}')"),
         };
         let entropy = match &c.entropy {
             Some(e) if e.enabled.unwrap_or(false) => {
@@ -165,6 +173,7 @@ impl Settings {
                 .clone()
                 .filter(|d| !d.trim().is_empty())
                 .unwrap_or_else(|| "p4a.ai".to_string()),
+            llm_latest_turn,
         })
     }
 
@@ -175,7 +184,13 @@ impl Settings {
             decode_base64: self.decode_base64,
             max_decoded_bytes: self.max_decoded_bytes,
             redact,
+            llm_media: false,
         }
+    }
+
+    /// Walker for LLM requests and responses.
+    pub fn llm_walker(&self, redact: bool) -> Walker<'_> {
+        Walker { llm_media: true, ..self.walker(redact, false) }
     }
 }
 
@@ -197,6 +212,14 @@ mod tests {
         assert!(!s.fail_closed);
         assert_eq!(s.max_body_bytes, 1_048_576);
         assert_eq!(s.error_domain, "p4a.ai");
+        assert!(!s.llm_latest_turn);
+    }
+
+    #[test]
+    fn llm_settings() {
+        let s = parse(serde_json::json!({"protocol": "llm", "llm": {"scanScope": "latestTurn"}})).unwrap();
+        assert_eq!(s.mode, Mode::Llm);
+        assert!(s.llm_latest_turn);
     }
 
     #[test]
@@ -219,6 +242,7 @@ mod tests {
         for bad in [
             serde_json::json!({"action": "drop"}),
             serde_json::json!({"protocol": "grpc"}),
+            serde_json::json!({"llm": {"scanScope": "everything"}}),
             serde_json::json!({"maxBodyBytes": 1}),
             serde_json::json!({"allowlist": {"skipPaths": ["nope"]}}),
             serde_json::json!({"customPatterns": [{"name": "x", "regex": "("}]}),

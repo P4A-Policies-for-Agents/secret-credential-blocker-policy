@@ -4,6 +4,7 @@
 
 pub mod a2a;
 pub mod jsonrpc;
+pub mod llm;
 pub mod mcp;
 pub mod multipart;
 pub mod query;
@@ -11,6 +12,7 @@ pub mod query;
 use serde_json::Value;
 
 use jsonrpc::Envelope;
+use llm::Dialect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -21,6 +23,8 @@ pub enum Protocol {
     A2aLegacy,
     A2aV1JsonRpc,
     A2aV1Http,
+    /// LLM provider API (OpenAI, Anthropic or Gemini request format).
+    Llm(Dialect),
 }
 
 impl Protocol {
@@ -32,6 +36,7 @@ impl Protocol {
             Protocol::A2aLegacy => "a2a-0.3",
             Protocol::A2aV1JsonRpc => "a2a-1.0-jsonrpc",
             Protocol::A2aV1Http => "a2a-1.0-http",
+            Protocol::Llm(d) => d.label(),
         }
     }
 
@@ -47,6 +52,7 @@ pub enum Mode {
     Rest,
     Mcp,
     A2a,
+    Llm,
 }
 
 /// Request facts known at the headers stage.
@@ -58,9 +64,21 @@ pub struct RequestMeta {
     /// Lowercased `content-type`, empty when absent.
     pub content_type: String,
     pub is_v1: bool,
+    /// Format named by the LLM proxy's `x-llm-input-format` / `x-input-format`.
+    pub llm: Option<Dialect>,
 }
 
 impl RequestMeta {
+    /// The LLM format, when this request is LLM traffic: named by the proxy
+    /// header, or any request when `protocol: llm` is forced.
+    fn llm_dialect(&self, mode: Mode) -> Option<Dialect> {
+        match mode {
+            Mode::Auto => self.llm,
+            Mode::Llm => Some(self.llm.or_else(|| llm::dialect_from_path(&self.path)).unwrap_or(Dialect::OpenAi)),
+            _ => None,
+        }
+    }
+
     pub fn is_grpc(&self) -> bool {
         self.content_type.starts_with("application/grpc")
     }
@@ -80,6 +98,8 @@ impl RequestMeta {
 pub enum BodyPlan {
     /// Walk the parsed JSON under each root (empty root = whole document).
     Json { roots: Vec<Vec<&'static str>>, push_config: bool },
+    /// Walk the conversation of an LLM request.
+    Llm(Dialect),
     Form,
     Multipart(String),
     Text,
@@ -100,7 +120,10 @@ pub struct Classified {
 /// Classification from headers alone: used for bodyless requests and for
 /// header/query findings that are blocked before the body arrives.
 pub fn provisional(mode: Mode, meta: &RequestMeta) -> (Protocol, Option<&'static str>) {
-    if mode != Mode::Rest && mode != Mode::Mcp {
+    if let Some(d) = meta.llm_dialect(mode) {
+        return (Protocol::Llm(d), None);
+    }
+    if mode != Mode::Rest && mode != Mode::Mcp && mode != Mode::Llm {
         if let Some(op) = a2a::http_json_operation(&meta.method, &meta.path) {
             // `message:send`, `tasks/{id}:cancel` are unambiguous even without the version header.
             let custom_verb = meta.path.rsplit('/').next().is_some_and(|s| s.contains(':'));
@@ -148,13 +171,24 @@ pub fn classify(mode: Mode, meta: &RequestMeta, body: &[u8], rest_body: bool, mu
         }
         return out;
     }
+    let llm_dialect = meta.llm_dialect(mode);
     let Ok(doc) = serde_json::from_slice::<Value>(body) else {
         // Unparseable "JSON": treat as text so a pasted secret is still found.
-        if rest_body {
+        if rest_body || llm_dialect.is_some() {
             out.plan = BodyPlan::Text;
         }
         return out;
     };
+    if let Some(header_dialect) = llm_dialect {
+        // The proxy header wins; the body shape decides when it is absent.
+        let shape = llm::detect(&meta.path, &doc);
+        let d = meta.llm.or(shape).unwrap_or(header_dialect);
+        out.protocol = Protocol::Llm(d);
+        out.op = Some(llm::operation(d, &meta.path, &doc));
+        out.plan = if shape.is_some() { BodyPlan::Llm(d) } else { BodyPlan::Json { roots: vec![vec![]], push_config: false } };
+        out.doc = Some(doc);
+        return out;
+    }
     let envelope = if mode == Mode::Rest { Envelope::NotJsonRpc } else { jsonrpc::envelope(&doc) };
     match envelope {
         Envelope::Single { method, id } => {
@@ -214,7 +248,7 @@ mod tests {
     use serde_json::json;
 
     fn meta(method: &str, path: &str, ct: &str, is_v1: bool) -> RequestMeta {
-        RequestMeta { method: method.into(), path: path.into(), content_type: ct.into(), is_v1 }
+        RequestMeta { method: method.into(), path: path.into(), content_type: ct.into(), is_v1, llm: None }
     }
 
     fn body(v: Value) -> Vec<u8> {
@@ -280,6 +314,36 @@ mod tests {
         let bin = meta("POST", "/", "application/octet-stream", false);
         assert_eq!(classify(Mode::Auto, &bin, b"\x00\x01", true, true).plan, BodyPlan::Skip);
         assert_eq!(classify(Mode::Auto, &m, b"{not json", true, true).plan, BodyPlan::Text);
+    }
+
+    #[test]
+    fn llm_header_selects_the_format() {
+        let mut m = meta("POST", "/v1/chat/completions", "application/json", false);
+        m.llm = Some(Dialect::Anthropic);
+        let b = body(json!({"model": "x", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}));
+        let c = classify(Mode::Auto, &m, &b, false, true);
+        assert_eq!((c.protocol, c.plan), (Protocol::Llm(Dialect::Anthropic), BodyPlan::Llm(Dialect::Anthropic)));
+        assert_eq!(provisional(Mode::Auto, &m).0, Protocol::Llm(Dialect::Anthropic));
+        // A JSON-RPC-looking body behind an LLM proxy is still LLM traffic.
+        let rpc = body(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}));
+        let c = classify(Mode::Auto, &m, &rpc, true, true);
+        assert_eq!(c.protocol, Protocol::Llm(Dialect::Anthropic));
+        assert_eq!(c.plan, BodyPlan::Json { roots: vec![vec![]], push_config: false });
+    }
+
+    #[test]
+    fn forced_llm_detects_from_shape_and_path() {
+        let m = meta("POST", "/v1beta/models/gemini:generateContent", "application/json", false);
+        let c = classify(Mode::Llm, &m, &body(json!({"contents": []})), false, true);
+        assert_eq!(c.protocol, Protocol::Llm(Dialect::Gemini));
+        assert_eq!(c.op.as_deref(), Some("generateContent"));
+        let m = meta("POST", "/chat", "application/json", false);
+        let c = classify(Mode::Llm, &m, &body(json!({"system": "s", "messages": []})), false, true);
+        assert_eq!(c.protocol, Protocol::Llm(Dialect::Anthropic));
+        assert_eq!(provisional(Mode::Llm, &meta("GET", "/v1/models", "", false)).0, Protocol::Llm(Dialect::OpenAi));
+        // Auto without the proxy header: plain REST.
+        let c = classify(Mode::Auto, &m, &body(json!({"messages": []})), true, true);
+        assert_eq!(c.protocol, Protocol::Rest);
     }
 
     #[test]

@@ -76,7 +76,7 @@ mod tests {
     fn run(raw: &str, redact: bool, skip: &[&str]) -> FormScan {
         let s = Scanner::new(&[], &[], None, Allowlist::default(), "").unwrap();
         let skip_set = SkipSet::default();
-        let w = Walker { scanner: &s, skip: &skip_set, decode_base64: false, max_decoded_bytes: 0, redact };
+        let w = Walker { scanner: &s, skip: &skip_set, decode_base64: false, max_decoded_bytes: 0, redact, llm_media: false };
         scan(raw, "query:", &w, |n| skip.contains(&n))
     }
 

@@ -33,12 +33,36 @@ impl Hit {
 /// `file.bytes`, A2A v1 `raw`, MCP resource `blob`.
 const BASE64_KEYS: &[&str] = &["bytes", "raw", "blob"];
 
+/// LLM media members: Anthropic `source.data`, Gemini `inlineData.data`,
+/// OpenAI `input_audio.data` / `file.file_data`. Data URIs are handled too.
+const LLM_MEDIA_KEYS: &[&str] = &["data", "file_data"];
+
+/// Base64 payloads shorter than this are scanned as plain text.
+const MIN_MEDIA_LEN: usize = 64;
+
+fn looks_base64(s: &str) -> bool {
+    s.len() >= MIN_MEDIA_LEN
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\n' | b'\r'))
+}
+
+/// `(prefix through ";base64,", payload)` of a base64 data URI.
+fn split_data_uri(s: &str) -> Option<(&str, &str)> {
+    if !s.starts_with("data:") {
+        return None;
+    }
+    let i = s.find(";base64,")? + ";base64,".len();
+    Some((&s[..i], &s[i..]))
+}
+
 pub struct Walker<'a> {
     pub scanner: &'a Scanner,
     pub skip: &'a SkipSet,
     pub decode_base64: bool,
     pub max_decoded_bytes: usize,
     pub redact: bool,
+    /// LLM traffic: base64 media is decoded when it is text and never
+    /// scanned as raw base64 otherwise.
+    pub llm_media: bool,
 }
 
 impl Walker<'_> {
@@ -54,8 +78,13 @@ impl Walker<'_> {
             path.push_key(key);
             node = next;
         }
+        self.walk_in(node, &mut path)
+    }
+
+    /// Scans `node`, located at `path` in its document.
+    pub fn walk_in(&self, node: &mut Value, path: &mut JsonPath) -> Vec<Hit> {
         let mut hits = Vec::new();
-        self.walk(node, &mut path, None, false, &mut hits);
+        self.walk(node, path, None, false, &mut hits);
         hits
     }
 
@@ -94,6 +123,20 @@ impl Walker<'_> {
                     }
                     return;
                 }
+                if self.llm_media {
+                    if let Some((prefix, payload)) = split_data_uri(s) {
+                        if let Some(rewritten) = self.scan_base64(payload, path, hits) {
+                            *s = format!("{prefix}{rewritten}");
+                        }
+                        return;
+                    }
+                    if LLM_MEDIA_KEYS.contains(&key) && looks_base64(s) {
+                        if let Some(rewritten) = self.scan_base64(s, path, hits) {
+                            *s = rewritten;
+                        }
+                        return;
+                    }
+                }
                 let findings = self.scanner.scan_field(key, s, in_service_account);
                 if findings.is_empty() {
                     return;
@@ -110,11 +153,12 @@ impl Walker<'_> {
     /// Decodes, scans and (when redacting) re-encodes a base64 member. Binary
     /// or oversized content is not scanned. Returns the replacement string.
     fn scan_base64(&self, encoded: &str, path: &JsonPath, hits: &mut Vec<Hit>) -> Option<String> {
-        if encoded.len() / 4 * 3 > self.max_decoded_bytes {
+        if !self.decode_base64 || encoded.len() / 4 * 3 > self.max_decoded_bytes {
             return None;
         }
         let engine = base64::engine::general_purpose::STANDARD;
-        let decoded = engine.decode(encoded.trim()).ok()?;
+        let compact: String = encoded.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let decoded = engine.decode(compact).ok()?;
         let text = String::from_utf8(decoded).ok()?;
         let findings = self.scanner.scan(&text);
         if findings.is_empty() {
@@ -147,6 +191,7 @@ mod tests {
             decode_base64: true,
             max_decoded_bytes: 1024,
             redact,
+            llm_media: false,
         }
     }
 

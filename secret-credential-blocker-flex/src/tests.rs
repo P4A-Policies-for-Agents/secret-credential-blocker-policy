@@ -349,3 +349,120 @@ fn sse_monitor_passes_through() {
     assert!(String::from_utf8_lossy(r.body()).contains(&token()));
     assert!(t.logs().iter().any(|l| l.contains("response") && l.contains("detector=github_token")));
 }
+
+// ── LLM traffic ─────────────────────────────────────────────────────────────
+
+fn llm_post(path: &str, format: &str, body: Value) -> UnitHttpRequest {
+    post(path, body).with_header("x-llm-input-format", format)
+}
+
+fn openai_chat(text: &str) -> Value {
+    json!({"model": "gpt-4o", "messages": [{"role": "user", "content": text}]})
+}
+
+#[test]
+fn llm_openai_request_block() {
+    let mut t = tester(json!({}));
+    let r = t.request(llm_post("/v1/chat/completions", "openai", openai_chat(&format!("deploy with {}", aws_id()))));
+    assert_eq!(r.status_code(), 400);
+    assert_eq!(r.header("content-type"), Some("application/json"));
+    let b = json_of(&r);
+    assert_eq!(b["error"]["type"], "invalid_request_error");
+    assert_eq!(b["error"]["code"], "secret_detected");
+    assert!(b["error"]["message"].as_str().unwrap().contains("$.messages[0].content"));
+    assert_no_leak(&t, &r, &aws_id());
+    assert!(t.logs().iter().any(|l| l.contains("llm-openai op=chat.completions") && l.contains("detector=aws_access_key_id")));
+}
+
+#[test]
+fn llm_anthropic_redact_and_parameters_untouched() {
+    let mut t = tester(json!({"action": "redact"}));
+    let body = json!({
+        "model": "claude-x", "max_tokens": 64, "system": "be brief",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": format!("token {}", token())}]}]
+    });
+    let r = t.request(llm_post("/v1/messages", "Anthropic", body.clone()));
+    assert_eq!(r.status_code(), 200);
+    let mut expected = body;
+    expected["messages"][0]["content"][0]["text"] = json!("token [REDACTED:github_token]");
+    assert_eq!(json_of(&r), expected);
+}
+
+#[test]
+fn llm_gemini_block_and_x_input_format_header() {
+    let mut t = tester(json!({}));
+    let body = json!({"contents": [{"role": "user", "parts": [{"text": format!("my key {}", token())}]}]});
+    let r = t.request(post("/v1beta/models/gemini-pro:generateContent", body).with_header("x-input-format", "gemini"));
+    assert_eq!(r.status_code(), 400);
+    let b = json_of(&r);
+    assert_eq!((b["error"]["code"].clone(), b["error"]["status"].clone()), (json!(400), json!("INVALID_ARGUMENT")));
+    assert_eq!(b["error"]["details"][0]["reason"], "SECRET_DETECTED");
+}
+
+#[test]
+fn llm_latest_turn_ignores_resent_history() {
+    let body = json!({"model": "m", "messages": [
+        {"role": "user", "content": format!("old {}", token())},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "thanks"}
+    ]});
+    let mut t = tester(json!({"llm": {"scanScope": "latestTurn"}}));
+    assert_eq!(t.request(llm_post("/v1/chat/completions", "openai", body.clone())).status_code(), 200);
+    let mut t = tester(json!({}));
+    assert_eq!(t.request(llm_post("/v1/chat/completions", "openai", body)).status_code(), 400);
+}
+
+#[test]
+fn llm_forced_mode_without_header() {
+    let mut t = tester(json!({"protocol": "llm"}));
+    let r = t.request(post("/v1/chat/completions", openai_chat(&token())));
+    assert_eq!(json_of(&r)["error"]["code"], "secret_detected");
+    // Without the header and in auto mode the same request is REST.
+    let mut t = tester(json!({}));
+    let r = t.request(post("/v1/chat/completions", openai_chat(&token())));
+    assert_eq!(r.header("content-type"), Some("application/problem+json"));
+}
+
+fn leaking_completion(_: UnitHttpRequest) -> UnitHttpResponse {
+    UnitHttpResponse::new(200)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"id": "c1", "choices": [{"index": 0, "message": {"role": "assistant", "content": format!("use {}", token())}}]}).to_string())
+}
+
+#[test]
+fn llm_response_block_and_redact() {
+    let mut t = tester_with(json!({"responseScanning": {"enabled": true}}), leaking_completion);
+    let r = t.request(llm_post("/v1/chat/completions", "openai", openai_chat("hi")));
+    let b = json_of(&r);
+    assert_eq!(b["error"]["type"], "server_error");
+    assert_no_leak(&t, &r, &token());
+    let mut t = tester_with(json!({"responseScanning": {"enabled": true, "action": "redact"}}), leaking_completion);
+    let b = json_of(&t.request(llm_post("/v1/chat/completions", "openai", openai_chat("hi"))));
+    assert_eq!(b["choices"][0]["message"]["content"], "use [REDACTED:github_token]");
+}
+
+/// Streams the token a few characters per event, Anthropic-style.
+fn anthropic_stream(_: UnitHttpRequest) -> UnitHttpResponse {
+    let mut s = String::from("event: message_start\ndata: {\"type\":\"message_start\"}\n\n");
+    let text = format!("here: {} end", token());
+    for piece in text.as_bytes().chunks(5) {
+        let d = json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": String::from_utf8_lossy(piece)}});
+        s.push_str(&format!("event: content_block_delta\ndata: {d}\n\n"));
+    }
+    s.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    UnitHttpResponse::new(200).with_header("content-type", "text/event-stream").with_body(s)
+}
+
+#[test]
+fn llm_stream_secret_split_across_deltas_terminates() {
+    // Redact acts as block on LLM streams.
+    let mut t = tester_with(json!({"responseScanning": {"enabled": true, "action": "redact"}}), anthropic_stream);
+    t.set_chunk_size(64);
+    let body = json!({"model": "c", "max_tokens": 9, "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let r = t.request(llm_post("/v1/messages", "anthropic", body));
+    let s = String::from_utf8_lossy(r.body()).into_owned();
+    assert!(s.contains("event: error\ndata: {\"type\":\"error\""), "{s}");
+    assert!(!s.contains("message_stop"), "{s}");
+    assert!(t.logs().iter().any(|l| l.contains("llm-anthropic") && l.contains("location=completion")));
+    assert_no_leak(&t, &r, &token());
+}

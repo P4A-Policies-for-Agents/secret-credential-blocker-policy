@@ -7,7 +7,8 @@ use pdk::policy_violation::PolicyViolations;
 use serde_json::Value;
 
 use crate::errors::{self, Detail, Direction, Reason};
-use crate::protocol::jsonrpc;
+use crate::protocol::llm::{self, DeltaWindow};
+use crate::protocol::{jsonrpc, Protocol};
 use crate::redact;
 use crate::report;
 use crate::request::ExchangeCtx;
@@ -23,7 +24,7 @@ enum Verdict {
 
 /// Scans one JSON or text payload (a whole body or one SSE `data` value).
 fn scan_payload(s: &Settings, ctx: &ExchangeCtx, text: &str, redact: bool) -> Verdict {
-    let walker = s.walker(redact, false);
+    let walker = if matches!(ctx.protocol, Protocol::Llm(_)) { s.llm_walker(redact) } else { s.walker(redact, false) };
     match serde_json::from_str::<Value>(text) {
         Ok(mut doc) => {
             let hits = if ctx.protocol.is_jsonrpc() && jsonrpc::is_response(&doc) {
@@ -118,7 +119,8 @@ pub async fn response_filter(
                 let bs = hs.into_body_state().await;
                 let body = bs.handler().body();
                 let mut rw = SseRewriter::default();
-                let mut f = |e: &Event| sse_event(s, r, &ctx, violations, e);
+                let mut window = DeltaWindow::default();
+                let mut f = |e: &Event| sse_event(s, r, &ctx, violations, e, &mut window);
                 let mut out = rw.push(&body, &mut f);
                 out.extend(rw.finish(&mut f));
                 if mode == SseMode::Buffer && out != body && bs.handler().set_body(&out).is_err() {
@@ -160,10 +162,20 @@ pub async fn response_filter(
     }
 }
 
-fn sse_event(s: &Settings, r: &ResponseSettings, ctx: &ExchangeCtx, v: &PolicyViolations, e: &Event) -> Outcome {
+fn sse_event(
+    s: &Settings,
+    r: &ResponseSettings,
+    ctx: &ExchangeCtx,
+    v: &PolicyViolations,
+    e: &Event,
+    window: &mut DeltaWindow,
+) -> Outcome {
     let Some(data) = e.data.as_deref() else { return Outcome::Keep };
     if data.trim() == "[DONE]" {
         return Outcome::Keep;
+    }
+    if let Protocol::Llm(d) = ctx.protocol {
+        return llm_sse_event(s, r, ctx, v, d, data, window);
     }
     let Verdict::Found(hits, redacted) = scan_payload(s, ctx, data, r.action == Action::Redact) else {
         return Outcome::Keep;
@@ -179,6 +191,47 @@ fn sse_event(s: &Settings, r: &ResponseSettings, ctx: &ExchangeCtx, v: &PolicyVi
     }
 }
 
+/// LLM streams: completion deltas are scanned as one running text, so a
+/// secret emitted a few characters per event is still found. Other events
+/// are scanned whole. A finding ends the stream with a provider-native error
+/// event; redact acts as block because earlier tokens were already sent.
+fn llm_sse_event(
+    s: &Settings,
+    r: &ResponseSettings,
+    ctx: &ExchangeCtx,
+    v: &PolicyViolations,
+    d: llm::Dialect,
+    data: &str,
+    window: &mut DeltaWindow,
+) -> Outcome {
+    let hits = match serde_json::from_str::<Value>(data) {
+        Ok(event) => {
+            let deltas = llm::stream_deltas(d, &event);
+            if deltas.is_empty() {
+                match scan_payload(s, ctx, data, false) {
+                    Verdict::Found(hits, _) => hits,
+                    Verdict::Clean => return Outcome::Keep,
+                }
+            } else {
+                Hit::from_findings("completion", &window.push(&s.scanner, &deltas))
+            }
+        }
+        Err(_) => Hit::from_findings("completion", &window.push(&s.scanner, &[data])),
+    };
+    if hits.is_empty() {
+        return Outcome::Keep;
+    }
+    report_hits(r, ctx, v, &hits);
+    if r.action == Action::Monitor {
+        return Outcome::Keep;
+    }
+    let detail = Detail { hits: &hits, show: s.error_detail, domain: &s.error_domain };
+    match errors::llm_stream_event(d, ctx.op.as_deref(), Reason::Secret, &detail) {
+        (Some(name), body) => Outcome::TerminateAs(name, body),
+        (None, body) => Outcome::Terminate(body),
+    }
+}
+
 async fn stream_sse(
     hs: ResponseHeadersState,
     s: &Settings,
@@ -189,7 +242,8 @@ async fn stream_sse(
     let bs = hs.into_body_stream_state().await;
     let mut stream = bs.stream();
     let mut rw = SseRewriter::default();
-    let mut f = |e: &Event| sse_event(s, r, ctx, v, e);
+    let mut window = DeltaWindow::default();
+    let mut f = |e: &Event| sse_event(s, r, ctx, v, e, &mut window);
     while let Some(chunk) = stream.next().await {
         let out = rw.push(chunk.bytes(), &mut f);
         if out.as_slice() != chunk.bytes() && bs.write_chunk(Chunk::new(out)).is_err() {

@@ -12,6 +12,8 @@ pub enum Outcome {
     Replace(String),
     /// Replace the data, emit the event, and drop everything after it.
     Terminate(String),
+    /// Like `Terminate`, also renaming the event (`event: <name>`).
+    TerminateAs(&'static str, String),
 }
 
 pub struct Event {
@@ -68,9 +70,13 @@ impl SseRewriter {
         let event = Event { data: data_of(raw) };
         match f(&event) {
             Outcome::Keep => out.extend_from_slice(raw),
-            Outcome::Replace(d) => out.extend_from_slice(&rebuild(raw, &d)),
+            Outcome::Replace(d) => out.extend_from_slice(&rebuild(raw, &d, None)),
             Outcome::Terminate(d) => {
-                out.extend_from_slice(&rebuild(raw, &d));
+                out.extend_from_slice(&rebuild(raw, &d, None));
+                self.terminated = true;
+            }
+            Outcome::TerminateAs(name, d) => {
+                out.extend_from_slice(&rebuild(raw, &d, Some(name)));
                 self.terminated = true;
             }
         }
@@ -118,14 +124,20 @@ fn data_of(raw: &[u8]) -> Option<String> {
     Some(parts.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>().join("\n"))
 }
 
-/// Re-emits the event with its data lines replaced, other fields kept in
-/// place and the original line ending preserved.
-fn rebuild(raw: &[u8], data: &str) -> Vec<u8> {
+/// Re-emits the event with its data lines replaced (and its `event:` name
+/// when `event` is set), other fields kept in place and the original line
+/// ending preserved.
+fn rebuild(raw: &[u8], data: &str, event: Option<&str>) -> Vec<u8> {
     let eol: &[u8] = if raw.windows(2).any(|w| w == b"\r\n") { b"\r\n" } else { b"\n" };
     let mut out = Vec::new();
     let mut wrote_data = false;
+    if let Some(name) = event {
+        out.extend_from_slice(b"event: ");
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(eol);
+    }
     for line in lines(raw) {
-        if line.is_empty() {
+        if line.is_empty() || (event.is_some() && line.starts_with(b"event")) {
             continue;
         }
         if data_value(line).is_some() {
@@ -159,6 +171,7 @@ mod tests {
         match &e.data {
             Some(d) if d.contains("secret") => Outcome::Replace(d.replace("secret", "[X]")),
             Some(d) if d.contains("stop") => Outcome::Terminate("{\"error\":1}".into()),
+            Some(d) if d.contains("halt") => Outcome::TerminateAs("error", "{\"e\":2}".into()),
             _ => Outcome::Keep,
         }
     }
@@ -201,6 +214,12 @@ mod tests {
         assert!(r.is_terminated());
         assert!(r.push(b"data: more\n\n", &mut f).is_empty());
         assert!(r.finish(&mut f).is_empty());
+    }
+
+    #[test]
+    fn terminate_as_renames_the_event() {
+        let out = run(&[b"event: content_block_delta\ndata: halt\n\ndata: after\n\n"]);
+        assert_eq!(out, b"event: error\ndata: {\"e\":2}\n\n".to_vec());
     }
 
     #[test]

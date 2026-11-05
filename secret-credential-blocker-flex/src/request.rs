@@ -6,7 +6,7 @@ use pdk::policy_violation::PolicyViolations;
 use serde_json::Value;
 
 use crate::errors::{self, Detail, Direction, Reason};
-use crate::protocol::{self, a2a, multipart, query, BodyPlan, Protocol, RequestMeta};
+use crate::protocol::{self, a2a, llm, multipart, query, BodyPlan, Protocol, RequestMeta};
 use crate::redact;
 use crate::report;
 use crate::settings::{Action, Settings};
@@ -54,6 +54,11 @@ pub async fn request_filter(
         path: path.to_string(),
         content_type: h.header("content-type").unwrap_or_default().trim().to_ascii_lowercase(),
         is_v1: a2a::is_v1(h.header("a2a-version").as_deref(), query_str),
+        llm: h
+            .header("x-llm-input-format")
+            .or_else(|| h.header("x-input-format"))
+            .as_deref()
+            .and_then(llm::Dialect::from_header),
     };
     let (prov, prov_op) = protocol::provisional(s.mode, &meta);
     let provisional = Target { protocol: prov, op: prov_op, id: None };
@@ -143,12 +148,22 @@ pub async fn request_filter(
     let before = hits.len();
     let rewritten: Option<Vec<u8>> = match &c.plan {
         BodyPlan::Json { roots, push_config } => {
-            let walker = s.walker(redact, *push_config);
+            let walker = if matches!(c.protocol, Protocol::Llm(_)) { s.llm_walker(redact) } else { s.walker(redact, *push_config) };
             match c.doc.as_mut() {
                 Some(doc) => {
                     for root in roots {
                         hits.extend(walker.walk_at(doc, root));
                     }
+                    (redact && hits.len() > before).then(|| serde_json::to_vec(doc).ok()).flatten()
+                }
+                None => None,
+            }
+        }
+        BodyPlan::Llm(d) => {
+            let walker = s.llm_walker(redact);
+            match c.doc.as_mut() {
+                Some(doc) => {
+                    hits.extend(llm::scan_request(doc, *d, s.llm_latest_turn, &walker));
                     (redact && hits.len() > before).then(|| serde_json::to_vec(doc).ok()).flatten()
                 }
                 None => None,

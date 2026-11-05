@@ -5,8 +5,8 @@
 # Secret & Credential Leakage Blocker
 
 A MuleSoft Omni Gateway custom policy that finds API keys, tokens, private keys,
-connection strings and other credentials in **REST**, **MCP** and **A2A (v0.3 and
-v1.0)** traffic, then **blocks**, **redacts** or **reports** them before they reach
+connection strings and other credentials in **REST**, **MCP**, **A2A (v0.3 and
+v1.0)** and **LLM** (OpenAI, Anthropic, Gemini formats) traffic, then **blocks**, **redacts** or **reports** them before they reach
 an upstream service, model, tool or agent. Built with the
 [Policy Development Kit (PDK)](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview)
 **1.10.0** as a split-model project.
@@ -18,7 +18,9 @@ messages to other agents, and that context often includes credentials. A key pas
 into a chat ends up in an MCP `tools/call`, a token read from a file ends up in an
 A2A `message/send`, and a tool result containing a connection string flows back to
 the model. This policy stops that at the gateway, with errors in the native format of
-each protocol so clients and agents can handle them.
+each protocol so clients and agents can handle them. On LLM traffic the errors use the
+provider's own error format, so OpenAI, Anthropic and Gemini SDKs raise a normal
+API error.
 
 ## What it scans
 
@@ -28,8 +30,9 @@ each protocol so clients and agents can handle them.
 | MCP | `tools/call` and `prompts/get` → `params.arguments`, `resources/read` → `params.uri`, `completion/complete` → `params.argument`. Notifications and list methods pass through. |
 | A2A v0.3 | JSON-RPC (`message/send`, `message/stream`, `tasks/*`) → `params`, including base64 `file.bytes` |
 | A2A v1.0 | JSON-RPC (`SendMessage`, …) and HTTP+JSON (`POST /message:send`, optional tenant prefix) |
+| LLM | Requests on LLM proxy instances (format from the `x-llm-input-format` header the proxy sets; `protocol: llm` also detects it from the body). Message text, system prompts, tool-call arguments and tool results, plus base64 text documents. Model, parameters, tool definitions and images are not scanned. `llm.scanScope: latestTurn` skips resent history. |
 | All | Query parameters (on by default) and any headers you list in `scan.headers` |
-| Responses | Optional (`responseScanning.enabled`): JSON/text bodies and SSE streams |
+| Responses | Optional (`responseScanning.enabled`): JSON/text bodies and SSE streams. LLM streams are scanned across deltas, so a secret split over tokens is still caught. |
 
 `Authorization`, `Cookie` and `Proxy-Authorization` are never scanned, because they
 are expected to carry credentials.
@@ -73,11 +76,12 @@ Every finding also raises a policy violation.
 | Property | Default | Notes |
 |---|---|---|
 | `action` | `block` | `block`, `redact` or `monitor` |
-| `protocol` | `auto` | `rest`, `mcp` or `a2a` skip detection |
+| `protocol` | `auto` | `rest`, `mcp`, `a2a` or `llm` skip detection |
+| `llm.scanScope` | `all` | `latestTurn` scans only the newest turn (earlier turns pass unscanned) |
 | `scan.queryParams` | `true` | |
 | `scan.multipart` | `true` | |
-| `responseScanning.enabled` | `false` | `action: inherit`; `sseMode: stream` |
-| `maxBodyBytes` | `1048576` | |
+| `responseScanning.enabled` | `false` | `action: inherit`; `sseMode: stream`. On LLM streams a finding ends the stream with an error event (`redact` acts as `block`) |
+| `maxBodyBytes` | `1048576` | LLM conversations usually need 4-8 MiB |
 | `oversizeBehavior` | `failOpen` | Applies to too-large, compressed and malformed-multipart bodies |
 | `errorDetail` | `true` | `false` removes detector names and locations from errors |
 
@@ -98,7 +102,7 @@ secret-credential-blocker-policy/
     │   ├── request.rs       # request leg (headers, query, body)
     │   ├── response.rs      # response leg (JSON/text, SSE)
     │   ├── detect/          # detectors, key-name and entropy checks, allowlist
-    │   ├── protocol/        # REST/MCP/A2A classification, query, form, multipart
+    │   ├── protocol/        # REST/MCP/A2A/LLM classification, query, form, multipart
     │   ├── walk.rs          # JSON walk with paths and base64 parts
     │   ├── errors.rs        # protocol-native error bodies
     │   ├── sse.rs           # incremental SSE rewriter

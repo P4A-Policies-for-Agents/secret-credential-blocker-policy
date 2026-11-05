@@ -1,6 +1,6 @@
 // Copyright 2026 Salesforce, Inc. All rights reserved.
 //! Secret & Credential Leakage Blocker: detects secrets and credentials in
-//! REST, MCP and A2A (v0.3 and v1.0) traffic and blocks, redacts or reports them.
+//! REST, MCP, A2A (v0.3 and v1.0) and LLM traffic and blocks, redacts or reports them.
 
 mod detect;
 mod errors;

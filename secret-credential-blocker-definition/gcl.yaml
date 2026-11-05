@@ -6,11 +6,11 @@ metadata:
     title: Secret & Credential Leakage Blocker
     description: >-
       Detects API keys, tokens, private keys, connection strings and other credentials in
-      REST, MCP and A2A (v0.3 and v1.0) traffic and blocks, redacts or reports them before
-      they leak to an upstream service, model, tool or agent.
+      REST, MCP, A2A (v0.3 and v1.0) and LLM (OpenAI, Anthropic, Gemini) traffic and blocks,
+      redacts or reports them before they leak to an upstream service, model, tool or agent.
     category: Security
     metadata/interfaceScope: api
-    metadata/capabilities/assetTypes: rest,http,mcp,a2a,a2a_v1
+    metadata/capabilities/assetTypes: rest,http,mcp,a2a,a2a_v1,llm
 spec:
   extends:
     - name: extension-definition
@@ -31,15 +31,35 @@ spec:
     protocol:
       title: Protocol
       description: >-
-        How to interpret traffic. "auto" recognizes MCP and A2A (v0.3 JSON-RPC, v1.0 JSON-RPC
-        and v1.0 HTTP+JSON) and treats everything else as REST. Force a value to skip detection.
+        How to interpret traffic. "auto" recognizes LLM proxy traffic (from the request format
+        header the LLM proxy sets), MCP and A2A (v0.3 JSON-RPC, v1.0 JSON-RPC and v1.0
+        HTTP+JSON) and treats everything else as REST. Force a value to skip detection; "llm"
+        detects the OpenAI, Anthropic or Gemini format from the request when the header is absent.
       type: string
       enum:
         - auto
         - rest
         - mcp
         - a2a
+        - llm
       default: auto
+    llm:
+      title: LLM Traffic
+      description: Settings for LLM proxy traffic (OpenAI, Anthropic and Gemini formats).
+      type: object
+      properties:
+        scanScope:
+          title: Scan Scope
+          description: >-
+            "all" scans the whole conversation on every call. "latestTurn" scans only the
+            messages after the last assistant turn (and the system prompt on the first turn),
+            so history the client resends is not reported again on every call; earlier turns
+            are then forwarded unscanned, so prefer it for monitor rollouts.
+          type: string
+          enum:
+            - all
+            - latestTurn
+          default: all
     disabledDetectors:
       title: Disabled Detectors
       description: Built-in detectors to turn off. All built-in detectors are on by default.
@@ -176,7 +196,9 @@ spec:
           default: true
         decodeBase64Parts:
           title: Decode Base64 Parts
-          description: Decode and scan text content carried as base64 (A2A file parts, MCP blobs).
+          description: >-
+            Decode and scan text content carried as base64 (A2A file parts, MCP blobs, LLM
+            documents). Binary content such as images is never scanned.
           type: boolean
           default: true
         maxDecodedBytes:
@@ -209,7 +231,9 @@ spec:
           title: SSE Mode
           description: >-
             How to handle text/event-stream responses. "stream" rewrites each event as it
-            passes, "buffer" reads the whole stream first, "monitor" only reports.
+            passes, "buffer" reads the whole stream first, "monitor" only reports. On LLM
+            streams, findings in the streamed completion end the stream with an error event
+            (redact acts as block, because earlier tokens were already sent).
           type: string
           enum:
             - stream
@@ -218,7 +242,9 @@ spec:
           default: stream
     maxBodyBytes:
       title: Max Body Bytes
-      description: Largest body that is scanned. Must be below the gateway connection buffer.
+      description: >-
+        Largest body that is scanned. Must be below the gateway connection buffer. LLM
+        conversations with long histories or images usually need 4-8 MiB.
       type: integer
       default: 1048576
     oversizeBehavior:
