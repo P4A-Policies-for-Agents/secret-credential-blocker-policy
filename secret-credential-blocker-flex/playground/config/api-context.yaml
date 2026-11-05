@@ -1,0 +1,41 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: PolicyBinding
+metadata:
+  name: ingress-http-api-context
+spec:
+  targetRef:
+    kind: ApiInstance
+    name: ingress-http
+  policyRef:
+    name: api-context
+  config:
+    api:
+      id: "00000000"
+      legacyApiId: ""
+      name: "playground-api"
+      version: "1.0.0"
+      basePath: "/"
+    environment:
+      clusterId: 'anypoint.default.svc'
+      # Complete below with Anypoint's org, env and credentials for local testing
+      organizationId: ''
+      environmentId: ''
+      masterOrganizationId: ''
+      anypoint:
+        clientId: ""
+        clientSecret: ""
+        serviceName: 'anypoint'
+        url: 'https://anypoint.mulesoft.com'
+      tiers:
+        - id: '0000000'
+          limits:
+            - maximumRequests: 20000
+              timePeriodInMilliseconds: 30000
+        - id: '0000001'
+          limits:
+            - maximumRequests: 100000
+              timePeriodInMilliseconds: 30000
+

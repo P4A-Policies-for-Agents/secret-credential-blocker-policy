@@ -1,0 +1,40 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+[package]
+name = "secret_credential_blocker"
+version = "1.0.0"
+rust-version = "1.88.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.anypoint]
+group_id = "00000000-0000-0000-0000-000000000000"
+definition_asset_id = { name = "secret-credential-blocker", version = "1.0.0" }
+implementation_asset_id = "secret-credential-blocker-flex"
+
+[dependencies]
+# `experimental` enables `write_chunk` on the streaming response body (SSE stream mode).
+pdk = { version = "1.10.0", features = ["experimental", "enable_stop_iteration"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+# Only the Unicode tables needed for \b/\w/\s and (?i) keep the wasm small.
+regex = { version = "1.12", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+sha2 = "0.10"
+base64 = "0.22"
+form_urlencoded = "1"
+anyhow = "1.0"
+
+[dev-dependencies]
+pdk-unit = { version = "1.10.0", features = ["experimental", "enable_stop_iteration", "experimental_local_mode", "experimental_logs"] }
+pdk-test = { version = "1.10.0" }
+httpmock = "0.6"
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "symbols"
+codegen-units = 1
+panic = "abort"

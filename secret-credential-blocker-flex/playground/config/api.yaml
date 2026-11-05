@@ -1,0 +1,38 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8185
+  services:
+    upstream:
+      address: "http://backend"
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: secret-credential-blocker-flex-v1-0
+        namespace: default
+      config:
+        # block | redact | monitor. Start with monitor in production.
+        action: block
+        # auto | rest | mcp | a2a
+        protocol: auto
+        scan:
+          headers:
+            - x-debug
+          queryParams: true
+          restBody: true
+          multipart: true
+        allowlist:
+          # e.g. "query:key" for APIs that authenticate with ?key=
+          skipPaths: []
+        responseScanning:
+          enabled: true
+          action: inherit
+          sseMode: stream
+        errorDetail: true

@@ -1,0 +1,255 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: Secret & Credential Leakage Blocker
+    description: >-
+      Detects API keys, tokens, private keys, connection strings and other credentials in
+      REST, MCP and A2A (v0.3 and v1.0) traffic and blocks, redacts or reports them before
+      they leak to an upstream service, model, tool or agent.
+    category: Security
+    metadata/interfaceScope: api
+    metadata/capabilities/assetTypes: rest,http,mcp,a2a,a2av1
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    action:
+      title: Action
+      description: >-
+        What to do when a secret is found in the request. "block" rejects the request with a
+        protocol-native error, "redact" replaces each secret with [REDACTED:<detector>] and
+        forwards the request, "monitor" only logs the finding and raises a policy violation.
+      type: string
+      enum:
+        - block
+        - redact
+        - monitor
+      default: block
+    protocol:
+      title: Protocol
+      description: >-
+        How to interpret traffic. "auto" recognizes MCP and A2A (v0.3 JSON-RPC, v1.0 JSON-RPC
+        and v1.0 HTTP+JSON) and treats everything else as REST. Force a value to skip detection.
+      type: string
+      enum:
+        - auto
+        - rest
+        - mcp
+        - a2a
+      default: auto
+    disabledDetectors:
+      title: Disabled Detectors
+      description: Built-in detectors to turn off. All built-in detectors are on by default.
+      type: array
+      items:
+        type: string
+        enum:
+          - aws_access_key_id
+          - aws_secret_access_key
+          - gcp_api_key
+          - gcp_service_account
+          - azure_storage_connection_string
+          - azure_sas_token
+          - github_token
+          - gitlab_token
+          - slack_token
+          - slack_webhook
+          - stripe_key
+          - anthropic_api_key
+          - openai_api_key
+          - jwt
+          - private_key_pem
+          - ssh_private_key
+          - db_connection_string
+          - basic_auth_url
+          - generic_secret_assignment
+      default: []
+    customPatterns:
+      title: Custom Patterns
+      description: >-
+        Additional named regular expressions (Rust regex syntax). Unanchored patterns are
+        wrapped in word boundaries. If the pattern has a capture group named "secret", only
+        that group is redacted.
+      type: array
+      items:
+        type: object
+        properties:
+          name:
+            title: Name
+            description: Detector name reported in logs and errors (letters, digits, _ and -).
+            type: string
+          regex:
+            title: Regex
+            type: string
+        required:
+          - name
+          - regex
+      default: []
+    entropy:
+      title: High-Entropy Detection
+      description: >-
+        Flag long random-looking tokens that no named detector matched. Off by default because
+        it is the noisiest detector.
+      type: object
+      properties:
+        enabled:
+          title: Enabled
+          type: boolean
+          default: false
+        threshold:
+          title: Threshold (bits per char)
+          type: number
+          default: 4.5
+        minLength:
+          title: Minimum Length
+          type: integer
+          default: 24
+    allowlist:
+      title: Allowlist
+      description: Known-safe values and locations that are never reported.
+      type: object
+      properties:
+        values:
+          title: Values
+          description: Exact values to ignore (hashed when the policy loads, never logged).
+          type: array
+          items:
+            type: string
+          default: []
+          "@context":
+            "@characteristics":
+              - "security:sensitive"
+        fingerprints:
+          title: Fingerprints
+          description: Finding fingerprints (sha256:...) copied from the policy logs to ignore.
+          type: array
+          items:
+            type: string
+          default: []
+        patterns:
+          title: Patterns
+          description: Regular expressions; a match that fully matches one of these is ignored.
+          type: array
+          items:
+            type: string
+          default: []
+        skipPaths:
+          title: Skip Paths
+          description: >-
+            Locations never scanned. JSON paths ($.params.arguments.token, $.items[*].key,
+            $..password), headers (header:x-api-key), query parameters (query:key), form fields
+            (form:password) and multipart fields (multipart:avatar).
+          type: array
+          items:
+            type: string
+          default: []
+    scan:
+      title: Scan Scope
+      type: object
+      properties:
+        headers:
+          title: Headers
+          description: >-
+            Request headers to scan. Authorization, Cookie and Proxy-Authorization are never
+            scanned because they are expected to carry credentials.
+          type: array
+          items:
+            type: string
+          default: []
+        queryParams:
+          title: Query Parameters
+          description: Scan URL query parameters.
+          type: boolean
+          default: true
+        restBody:
+          title: REST Bodies
+          description: Scan JSON, form and text bodies of non-MCP, non-A2A requests.
+          type: boolean
+          default: true
+        multipart:
+          title: Multipart Bodies
+          description: Scan text and JSON parts of multipart/form-data and multipart/mixed bodies.
+          type: boolean
+          default: true
+        decodeBase64Parts:
+          title: Decode Base64 Parts
+          description: Decode and scan text content carried as base64 (A2A file parts, MCP blobs).
+          type: boolean
+          default: true
+        maxDecodedBytes:
+          title: Max Decoded Bytes
+          description: Largest base64 payload that is decoded and scanned.
+          type: integer
+          default: 262144
+    responseScanning:
+      title: Response Scanning
+      description: >-
+        Also scan upstream responses. A response block cannot change the HTTP status that was
+        already sent, so the body is replaced with a protocol-native error instead.
+      type: object
+      properties:
+        enabled:
+          title: Enabled
+          type: boolean
+          default: false
+        action:
+          title: Response Action
+          description: Action for responses. "inherit" uses the request action.
+          type: string
+          enum:
+            - inherit
+            - block
+            - redact
+            - monitor
+          default: inherit
+        sseMode:
+          title: SSE Mode
+          description: >-
+            How to handle text/event-stream responses. "stream" rewrites each event as it
+            passes, "buffer" reads the whole stream first, "monitor" only reports.
+          type: string
+          enum:
+            - stream
+            - buffer
+            - monitor
+          default: stream
+    maxBodyBytes:
+      title: Max Body Bytes
+      description: Largest body that is scanned. Must be below the gateway connection buffer.
+      type: integer
+      default: 1048576
+    oversizeBehavior:
+      title: Oversize Behavior
+      description: >-
+        What to do with bodies that cannot be scanned (too large, compressed, malformed
+        multipart). "failOpen" forwards them and logs a warning; "failClosed" rejects them.
+      type: string
+      enum:
+        - failOpen
+        - failClosed
+      default: failOpen
+    errorDetail:
+      title: Error Detail
+      description: >-
+        Include detector names and locations in error responses. Secret values and
+        fingerprints are never returned to the client.
+      type: boolean
+      default: true
+    errorDomain:
+      title: Error Domain
+      description: Domain used in A2A v1.0 google.rpc.ErrorInfo error details.
+      type: string
+      default: p4a.ai
+    fingerprintSalt:
+      title: Fingerprint Salt
+      description: >-
+        Optional salt mixed into finding fingerprints so they cannot be compared across
+        deployments.
+      type: string
+      default: ""
+      "@context":
+        "@characteristics":
+          - "security:sensitive"
