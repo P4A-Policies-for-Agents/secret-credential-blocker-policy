@@ -6,8 +6,8 @@ metadata:
     title: Secret & Credential Leakage Blocker
     description: >-
       Detects API keys, tokens, private keys, connection strings and other credentials in
-      REST, MCP, A2A (v0.3 and v1.0) and LLM (OpenAI, Anthropic, Gemini) traffic and blocks,
-      redacts or reports them before they leak to an upstream service, model, tool or agent.
+      REST, MCP, A2A (v0.3 and v1.0) and LLM traffic and blocks, redacts or reports them
+      before they leak to an upstream service, model, tool or agent.
     category: Security
     metadata/interfaceScope: api
     metadata/capabilities/assetTypes: rest,http,mcp,a2a,a2a_v1,llm
