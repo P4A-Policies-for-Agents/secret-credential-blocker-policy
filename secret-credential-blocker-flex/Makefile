@@ -23,14 +23,7 @@ setup: install-cargo-anypoint ## Setup Cargo Anypoint to build
 .PHONY: build-asset-files
 build-asset-files:  ## Retrieves the definition from exchange
 	@anypoint-cli-v4 pdk fetch-policy --gav=$(DEFINITION_GAV)
-	@# Note: src/generated/config.rs is hand-maintained because the GCL schema uses
-	@# nested objects (scan, allowlist, entropy, responseScanning) and an object
-	@# array (customPatterns[]) which the current `cargo anypoint config-gen`
-	@# cannot prettify. The hand-rolled struct is checked in; do NOT regenerate it.
-	@if [ ! -f src/generated/config.rs ]; then \
-		echo "Error: src/generated/config.rs is missing. Restore from version control."; \
-		exit 1; \
-	fi
+	@cargo anypoint config-gen --output ./src/generated/config.rs
 
 .PHONY: build
 build: ## Builds the policy implementation

@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::detect::{allowlist::Allowlist, entropy::EntropyDetector, CustomSpec, Scanner};
-use crate::generated::config::Config;
+use crate::generated::config::{AllowlistConfig, Config};
 use crate::path::SkipSet;
 use crate::protocol::Mode;
 use crate::walk::Walker;
@@ -81,40 +81,43 @@ impl Settings {
             "a2a" => Mode::A2a,
             other => bail!("protocol must be auto, rest, mcp or a2a (got '{other}')"),
         };
-        let e = c.entropy.clone().unwrap_or_default();
-        let entropy = if e.enabled.unwrap_or(false) {
-            let min_length = bounded(e.min_length, 24, 8, 1024, "entropy.minLength")?;
-            Some(EntropyDetector::new(e.threshold.unwrap_or(4.5), min_length)?)
-        } else {
-            None
+        let entropy = match &c.entropy {
+            Some(e) if e.enabled.unwrap_or(false) => {
+                let min_length = bounded(e.min_length, 24, 8, 1024, "entropy.minLength")?;
+                Some(EntropyDetector::new(e.threshold.unwrap_or(4.5), min_length)?)
+            }
+            _ => None,
         };
-        let al = c.allowlist.clone().unwrap_or_default();
-        let allowlist = Allowlist::new(&al.values, &al.fingerprints, &al.patterns)?;
-        let skip = SkipSet::parse(&al.skip_paths)?;
-        let mut push_paths = al.skip_paths.clone();
+        let al = c.allowlist.as_ref();
+        let list = |f: fn(&AllowlistConfig) -> &Option<Vec<String>>| al.and_then(|a| f(a).clone()).unwrap_or_default();
+        let skip_paths = list(|a| &a.skip_paths);
+        let allowlist = Allowlist::new(&list(|a| &a.values), &list(|a| &a.fingerprints), &list(|a| &a.patterns))?;
+        let skip = SkipSet::parse(&skip_paths)?;
+        let mut push_paths = skip_paths;
         push_paths.extend(PUSH_CREDENTIAL_PATHS.iter().map(|p| p.to_string()));
         let push_skip = SkipSet::parse(&push_paths)?;
         let custom: Vec<CustomSpec> = c
             .custom_patterns
             .iter()
+            .flatten()
             .map(|p| CustomSpec { name: &p.name, regex: &p.regex })
             .collect();
         let scanner = Scanner::new(
-            &c.disabled_detectors,
+            c.disabled_detectors.as_deref().unwrap_or_default(),
             &custom,
             entropy,
             allowlist,
             c.fingerprint_salt.as_deref().unwrap_or(""),
         )?;
-        let s = c.scan.clone().unwrap_or_default();
+        let s = c.scan.as_ref();
         let headers = s
-            .headers
-            .iter()
+            .and_then(|s| s.headers.as_ref())
+            .into_iter()
+            .flatten()
             .map(|h| h.trim().to_ascii_lowercase())
             .filter(|h| !h.is_empty() && !NEVER_SCANNED_HEADERS.contains(&h.as_str()))
             .collect();
-        let r = c.response_scanning.clone().unwrap_or_default();
-        let response = if r.enabled.unwrap_or(false) {
+        let response = if let Some(r) = c.response_scanning.as_ref().filter(|r| r.enabled.unwrap_or(false)) {
             let raction = match r.action.as_deref().unwrap_or("inherit") {
                 "inherit" => action,
                 other => self::action(Some(other), "responseScanning.action")?,
@@ -142,11 +145,17 @@ impl Settings {
             skip,
             push_skip,
             headers,
-            query_params: s.query_params.unwrap_or(true),
-            rest_body: s.rest_body.unwrap_or(true),
-            multipart: s.multipart.unwrap_or(true),
-            decode_base64: s.decode_base64_parts.unwrap_or(true),
-            max_decoded_bytes: bounded(s.max_decoded_bytes, 262_144, 0, 4_194_304, "scan.maxDecodedBytes")?,
+            query_params: s.and_then(|s| s.query_params).unwrap_or(true),
+            rest_body: s.and_then(|s| s.rest_body).unwrap_or(true),
+            multipart: s.and_then(|s| s.multipart).unwrap_or(true),
+            decode_base64: s.and_then(|s| s.decode_base_64_parts).unwrap_or(true),
+            max_decoded_bytes: bounded(
+                s.and_then(|s| s.max_decoded_bytes),
+                262_144,
+                0,
+                4_194_304,
+                "scan.maxDecodedBytes",
+            )?,
             response,
             max_body_bytes: bounded(c.max_body_bytes, 1_048_576, 1024, 16_777_216, "maxBodyBytes")?,
             fail_closed,
